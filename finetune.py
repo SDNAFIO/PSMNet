@@ -16,6 +16,7 @@ import skimage.transform
 import numpy as np
 import time
 import math
+import matplotlib.pyplot as plt
 from dataloader import KITTIloader2015 as ls
 from dataloader import KITTILoader as DA
 
@@ -55,11 +56,11 @@ all_left_img, all_right_img, all_left_disp, test_left_img, test_right_img, test_
 
 TrainImgLoader = torch.utils.data.DataLoader(
          DA.myImageFloder(all_left_img,all_right_img,all_left_disp, True), 
-         batch_size= 12, shuffle= True, num_workers= 8, drop_last=False)
+         batch_size= 2, shuffle= True, num_workers=1, drop_last=False)
 
 TestImgLoader = torch.utils.data.DataLoader(
          DA.myImageFloder(test_left_img,test_right_img,test_left_disp, False), 
-         batch_size= 8, shuffle= False, num_workers= 4, drop_last=False)
+         batch_size= 2, shuffle= False, num_workers=1, drop_last=False)
 
 if args.model == 'stackhourglass':
     model = stackhourglass(args.maxdisp)
@@ -72,9 +73,9 @@ if args.cuda:
     model = nn.DataParallel(model)
     model.cuda()
 
-if args.loadmodel is not None:
-    state_dict = torch.load(args.loadmodel)
-    model.load_state_dict(state_dict['state_dict'])
+#if args.loadmodel is not None:
+#    state_dict = torch.load(args.loadmodel)
+#    model.load_state_dict(state_dict['state_dict'])
 
 print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
@@ -112,7 +113,7 @@ def train(imgL,imgR,disp_L):
 
         return loss.data[0]
 
-def test(imgL,imgR,disp_true):
+def test(imgL,imgR,disp_true, batch_idx, epoch_nr, path):
         model.eval()
         imgL   = Variable(torch.FloatTensor(imgL))
         imgR   = Variable(torch.FloatTensor(imgR))   
@@ -125,20 +126,30 @@ def test(imgL,imgR,disp_true):
         pred_disp = output3.data.cpu()
 
         #computing 3-px error#
-        true_disp = disp_true
-        index = np.argwhere(true_disp>0)
-        disp_true[index[0][:], index[1][:], index[2][:]] = np.abs(true_disp[index[0][:], index[1][:], index[2][:]]-pred_disp[index[0][:], index[1][:], index[2][:]])
-        correct = (disp_true[index[0][:], index[1][:], index[2][:]] < 3)|(disp_true[index[0][:], index[1][:], index[2][:]] < true_disp[index[0][:], index[1][:], index[2][:]]*0.05)      
+        valid_pixel_mask = (disp_true.data.numpy()>0)
+        bad_3 = np.count_nonzero(np.abs((valid_pixel_mask * pred_disp.data.numpy()) - disp_true.data.numpy()) > 3) / float(
+            np.count_nonzero(valid_pixel_mask))
+
+        if batch_idx is 0 and epoch_nr % 5 == 0:
+            plt.imsave('{}/1_{}.png'.format(path, epoch_nr), pred_disp[0, :, :].data.numpy())
+            plt.imsave('{}/2_{}.png'.format(path, epoch_nr), pred_disp[1, :, :].data.numpy())
+            print('{} - saved images'.format(path))
+
+
+        #true_disp = disp_true
+        #index = np.argwhere(true_disp.data.numpy()>0)
+        #disp_true[index[0][:], index[1][:], index[2][:]] = np.abs(true_disp[index[0][:], index[1][:], index[2][:]]-pred_disp[index[0][:], index[1][:], index[2][:]])
+        #correct = (disp_true[index[0][:], index[1][:], index[2][:]] < 3)|(disp_true[index[0][:], index[1][:], index[2][:]] < true_disp[index[0][:], index[1][:], index[2][:]]*0.05)
         torch.cuda.empty_cache()
 
-        return 1-(float(torch.sum(correct))/float(len(index[0])))
+        return bad_3
 
 def adjust_learning_rate(optimizer, epoch):
     if epoch <= 200:
        lr = 0.001
     else:
        lr = 0.0001
-    print(lr)
+    print('\tlearning rate: {}'.format(lr))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -153,31 +164,42 @@ def main():
         total_test_loss = 0
         adjust_learning_rate(optimizer,epoch)
 
-        # test
+        # train
         for batch_idx, (imgL_crop, imgR_crop, disp_crop_L) in enumerate(TrainImgLoader):
             start_time = time.time()
 
             loss = train(imgL_crop,imgR_crop, disp_crop_L)
-            print('Iter %d training loss = %.3f , time = %.2f' %(batch_idx, loss, time.time() - start_time))
+            #print('Iter %d training loss = %.3f , time = %.2f' %(batch_idx, loss, time.time() - start_time))
             total_train_loss += loss
 
         print('epoch %d total training loss = %.3f' %(epoch, total_train_loss/len(TrainImgLoader)))
 
+        if epoch % 5 == 0:
+            # pixel error of train
+            for batch_idx, (imgL, imgR, disp_L) in enumerate(TrainImgLoader):
+                test_loss = test(imgL,imgR, disp_L, batch_idx, epoch, 'train')
+                #print('Iter %d 3-px error in val = %.3f' %(batch_idx, test_loss*100))
+                total_test_loss += test_loss
+            print('epoch %d total 3-px error in train = %.3f' %(epoch, total_test_loss/len(TrainImgLoader)*100))
+            total_test_loss = 0
+
         # test
         for batch_idx, (imgL, imgR, disp_L) in enumerate(TestImgLoader):
-           test_loss = test(imgL,imgR, disp_L)
-           print('Iter %d 3-px error in val = %.3f' %(batch_idx, test_loss*100))
+           test_loss = test(imgL,imgR, disp_L, batch_idx, epoch, 'test')
+           #print('Iter %d 3-px error in val = %.3f' %(batch_idx, test_loss*100))
            total_test_loss += test_loss
-
         print('epoch %d total 3-px error in val = %.3f' %(epoch, total_test_loss/len(TestImgLoader)*100))
+
+
         if total_test_loss/len(TestImgLoader)*100 > max_acc:
             max_acc = total_test_loss/len(TestImgLoader)*100
             max_epo = epoch
-        print('MAX epoch %d total test error = %.3f' %(max_epo, max_acc))
+        print('\tMAX epoch %d total test error = %.3f' %(max_epo, max_acc))
 
-        savefilename = args.savemodel+'finetune_'+str(epoch)+'.tar'
-        torch.save({ 'epoch': epoch, 'state_dict': model.state_dict(), 'train_loss': total_train_loss/len(TrainImgLoader), 'test_loss': total_test_loss/len(TestImgLoader)*100, }, savefilename)
-        print('full finetune time = %.2f HR' %((time.time() - start_full_time)/3600))
+        if epoch % 5 == 0:
+            savefilename = args.savemodel+'finetune_'+str(epoch)+'.tar'
+            torch.save({ 'epoch': epoch, 'state_dict': model.state_dict(), 'train_loss': total_train_loss/len(TrainImgLoader), 'test_loss': total_test_loss/len(TestImgLoader)*100, }, savefilename)
+
     print(max_epo)
     print(max_acc)
 
